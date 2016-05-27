@@ -1,0 +1,371 @@
+#!/bin/sh
+
+# dhclient-script for Linux. Dan Halbert, March, 1997.
+# Updated for Linux 2.[12] by Brian J. Murrell, January 1999.
+# Modified for Debian.  Matt Zimmerman and Eloy Paris, December 2003
+# Modified to remove useless tests for antiquated kernel versions that
+# this doesn't even work with anyway, and introduces a dependency on /usr
+# being mounted, which causes cosmetic errors on hosts that NFS mount /usr
+# Andrew Pollock, February 2005
+# Modified to work on point-to-point links. Andrew Pollock, June 2005
+# Modified to support passing the parameters called with to the hooks. Andrew Pollock, November 2005
+
+# The alias handling in here probably still sucks. -mdz
+
+# Modified to handle multiple WANs via DHCP by Ryan Castellucci April 2016
+# * routes added with proto dhcp
+# * route added to dhcp server ip because dhclient doesn't bind source
+# * DHCPv6 support removed becasue I don't want to deal with it
+# * resolv_conf support removed because ISP DNS is shit
+# * hostname setting support removed because why would you want that?
+# * aliases totally untested because I don't use them
+# * routing rule priorities will collide and cause problems if you're unlucky
+
+# update /etc/resolv.conf based on received values
+make_resolv_conf() {
+    # do nothing
+    true
+}
+
+# set host name
+set_hostname() {
+    # do nothing
+    true
+}
+
+# run given script
+run_hook() {
+    local script
+    local exit_status
+    script="$1"
+
+    if [ -f $script ]; then
+        . $script
+    fi
+
+    if [ -n "$exit_status" ] && [ "$exit_status" -ne 0 ]; then
+        logger -p daemon.err "$script returned non-zero exit status $exit_status"
+    fi
+
+    return $exit_status
+}
+
+# run scripts in given directory
+run_hookdir() {
+    local dir
+    local exit_status
+    dir="$1"
+
+    if [ -d "$dir" ]; then
+        for script in $(run-parts --list $dir); do
+            run_hook $script || true
+            exit_status=$?
+        done
+    fi
+
+    return $exit_status
+}
+
+# Must be used on exit.   Invokes the local dhcp client exit hooks, if any.
+exit_with_hooks() {
+    exit_status=$1
+
+    # Source the documented exit-hook script, if it exists
+    if ! run_hook /etc/dhcp/dhclient-exit-hooks; then
+        exit_status=$?
+    fi
+
+    # Now run scripts in the Debian-specific directory.
+    if ! run_hookdir /etc/dhcp/dhclient-exit-hooks.d; then
+        exit_status=$?
+    fi
+
+    exit $exit_status
+}
+
+get_iface_n() {
+    case "$interface" in
+#        vlan0)
+#            echo 101
+#            ;;
+#        eth2)
+#            echo 102
+#            ;;
+        *)
+            # if this generates a colision on your system, edit above
+            echo $(($(printf '%u\n' `echo -n 0x;echo -n $interface | md5sum | head -c8`)%900+100))
+            ;;
+    esac
+}
+
+ipset_create_if_needed() {
+    ipset list ${1}-ip >/dev/null 2>&1 || \
+    ipset create ${1}-ip hash:ip family inet hashsize 16 maxelem 64
+}
+
+ipset_flush() {
+    if which ipset >/dev/null; then
+	ipset_create_if_needed ${1}
+        ipset flush ${1}-ip
+    fi
+}
+
+ipset_add() {
+    if which ipset >/dev/null; then
+	ipset_create_if_needed ${1}
+	ipset add ${1}-ip ${2}
+    fi
+}
+
+
+# The 576 MTU is only used for X.25 and dialup connections
+# where the admin wants low latency.  Such a low MTU can cause
+# problems with UDP traffic, among other things.  As such,
+# disallow MTUs from 576 and below by default, so that broken
+# MTUs are ignored, but higher stuff is allowed (1492, 1500, etc).
+if [ -z "$new_interface_mtu" ] || [ "$new_interface_mtu" -le 576 ]; then
+    new_interface_mtu=''
+fi
+
+
+# The action starts here
+
+# Invoke the local dhcp client enter hooks, if they exist.
+run_hook /etc/dhcp/dhclient-enter-hooks
+run_hookdir /etc/dhcp/dhclient-enter-hooks.d
+
+# Execute the operation
+case "$reason" in
+
+    ### DHCPv4 Handlers
+
+    MEDIUM|ARPCHECK|ARPSEND)
+        # Do nothing
+        ;;
+    PREINIT)
+        # The DHCP client is requesting that an interface be
+        # configured as required in order to send packets prior to
+        # receiving an actual address. - dhclient-script(8)
+
+        # ensure interface is up
+        ip link set dev ${interface} up
+
+        if [ -n "$alias_ip_address" ]; then
+            # flush alias IP from interface
+            ip -4 addr flush dev ${interface} label ${interface}:0
+        fi
+
+        ;;
+
+    BOUND|RENEW|REBIND|REBOOT)
+        set_hostname
+
+        if [ -n "$old_ip_address" ] && [ -n "$alias_ip_address" ] &&
+           [ "$alias_ip_address" != "$old_ip_address" ]; then
+            # alias IP may have changed => flush it
+            ip -4 addr flush dev ${interface} label ${interface}:0
+        fi
+
+        if [ -n "$old_ip_address" ] &&
+           [ "$old_ip_address" != "$new_ip_address" ]; then
+            # leased IP has changed => flush it
+            ip -4 addr flush dev ${interface} label ${interface}
+            ipset_flush ${interface}
+        fi
+
+        if [ -z "$old_ip_address" ] ||
+           [ "$old_ip_address" != "$new_ip_address" ] ||
+           [ "$reason" = "BOUND" ] || [ "$reason" = "REBOOT" ]; then
+            # new IP has been leased or leased IP changed => set it
+            ip -4 addr add ${new_ip_address}${new_subnet_mask:+/$new_subnet_mask} \
+                ${new_broadcast_address:+broadcast $new_broadcast_address} \
+                dev ${interface} label ${interface}
+            ipset_add ${interface} ${new_ip_address}
+
+            if [ -n "$new_interface_mtu" ]; then
+                # set MTU
+                ip link set dev ${interface} mtu ${new_interface_mtu}
+            fi
+
+            # if we have $new_rfc3442_classless_static_routes then we have to
+            # ignore $new_routers entirely
+            if [ ! "$new_rfc3442_classless_static_routes" ]; then
+                # set if_metric if IF_METRIC is set or there's more than one router
+                if_metric="$IF_METRIC"
+                if [ "${new_routers%% *}" != "${new_routers}" ]; then
+                    if_metric=${if_metric:-1}
+                fi
+
+                for router in $new_routers; do
+                    if [ "$new_subnet_mask" = "255.255.255.255" ]; then
+                        # point-to-point connection => set explicit route
+                        ip -4 route add ${router} dev ${interface} table ${interface} \
+                            proto dhcp >/dev/null 2>&1
+                    fi
+
+                    # set default route
+                    ip -4 route add default via ${router} dev ${interface} \
+                        ${if_metric:+metric $if_metric} table ${interface} proto dhcp >/dev/null 2>&1
+
+                    if [ -n "$new_dhcp_server_identifier" ]; then
+                        # add route to DHCP server
+                        ip -4 route add ${new_dhcp_server_identifier} via ${router} \
+                            dev ${interface} proto dhcp >/dev/null 2>&1
+                    fi
+
+                    # clear possible old route rules
+                    ip -4 rule del prio `get_iface_n`0 >/dev/null 2>/dev/null
+                    ip -4 rule del prio `get_iface_n`1 >/dev/null 2>/dev/null
+
+                    # set route rules
+                    ip -4 rule add from ${new_ip_address} lookup ${interface} prio `get_iface_n`0 >/dev/null 2>&1
+                    ip -4 rule add oif ${interface} lookup ${interface} prio `get_iface_n`1 >/dev/null 2>&1
+
+                    if [ -n "$if_metric" ]; then
+                        if_metric=$((if_metric+1))
+                    fi
+                done
+            fi
+        fi
+
+        if [ -n "$alias_ip_address" ] &&
+           [ "$new_ip_address" != "$alias_ip_address" ]; then
+            # separate alias IP given, which may have changed
+            # => flush it, set it & add host route to it
+            ip -4 addr flush dev ${interface} label ${interface}:0
+            ip -4 addr add ${alias_ip_address}${alias_subnet_mask:+/$alias_subnet_mask} \
+                dev ${interface} label ${interface}:0
+            ip -4 route add ${alias_ip_address} dev ${interface} proto dhcp >/dev/null 2>&1
+        fi
+
+        # update /etc/resolv.conf
+        make_resolv_conf
+
+        ;;
+
+    EXPIRE|FAIL|RELEASE|STOP)
+        if [ -n "$alias_ip_address" ]; then
+            # flush alias IP
+            ip -4 addr flush dev ${interface} label ${interface}:0
+        fi
+
+        if [ -n "$old_ip_address" ]; then
+            # flush leased IP
+            ip -4 addr flush dev ${interface} label ${interface}
+            ipset_flush ${interface}
+
+            # clear possible old route rules
+            ip -4 rule del prio `get_iface_n`0 >/dev/null 2>/dev/null
+            ip -4 rule del prio `get_iface_n`1 >/dev/null 2>/dev/null
+        fi
+
+        if [ -n "$alias_ip_address" ]; then
+            # alias IP given => set it & add host route to it
+            ip -4 addr add ${alias_ip_address}${alias_subnet_mask:+/$alias_subnet_mask} \
+                dev ${interface} label ${interface}:0
+            ip -4 route add ${alias_ip_address} dev ${interface} proto dhcp >/dev/null 2>&1
+        fi
+
+        ;;
+
+    TIMEOUT)
+        if [ -n "$alias_ip_address" ]; then
+            # flush alias IP
+            ip -4 addr flush dev ${interface} label ${interface}:0
+        fi
+
+        # set IP from recorded lease
+        ip -4 addr add ${new_ip_address}${new_subnet_mask:+/$new_subnet_mask} \
+            ${new_broadcast_address:+broadcast $new_broadcast_address} \
+            dev ${interface} label ${interface}
+
+        if [ -n "$new_interface_mtu" ]; then
+            # set MTU
+            ip link set dev ${interface} mtu ${new_interface_mtu}
+        fi
+
+        # if there is no router recorded in the lease or the 1st router answers pings
+        if [ -z "$new_routers" ] || ping -q -c 1 "${new_routers%% *}"; then
+            # if we have $new_rfc3442_classless_static_routes then we have to
+            # ignore $new_routers entirely
+            if [ ! "$new_rfc3442_classless_static_routes" ]; then
+                if [ -n "$alias_ip_address" ] &&
+                   [ "$new_ip_address" != "$alias_ip_address" ]; then
+                    # separate alias IP given => set up the alias IP & add host route to it
+                    ip -4 addr add ${alias_ip_address}${alias_subnet_mask:+/$alias_subnet_mask} \
+                        dev ${interface} label ${interface}:0
+                    ip -4 route add ${alias_ip_address} dev ${interface} \
+                        table ${interface} proto dhcp >/dev/null 2>&1
+                fi
+
+                # set if_metric if IF_METRIC is set or there's more than one router
+                if_metric="$IF_METRIC"
+                if [ "${new_routers%% *}" != "${new_routers}" ]; then
+                    if_metric=${if_metric:-1}
+                fi
+
+                # set default route
+                for router in $new_routers; do
+                    ip -4 route add default via ${router} dev ${interface} \
+                        ${if_metric:+metric $if_metric} table ${interface} proto dhcp >/dev/null 2>&1
+
+                    if [ -n "$new_dhcp_server_identifier" ]; then
+                        # add route to DHCP server
+                        ip -4 route add ${new_dhcp_server_identifier} via ${router} \
+                            dev ${interface} proto dhcp >/dev/null 2>&1
+                    fi
+
+                    # clear possible old route rules
+                    ip -4 rule del prio `get_iface_n`0 >/dev/null 2>/dev/null
+                    ip -4 rule del prio `get_iface_n`1 >/dev/null 2>/dev/null
+
+                    # set route rules
+                    ip -4 rule add from ${new_ip_address} lookup ${interface} prio `get_iface_n`0 >/dev/null 2>&1
+                    ip -4 rule add oif ${interface} lookup ${interface} prio `get_iface_n`1 >/dev/null 2>&1
+
+                    if [ -n "$if_metric" ]; then
+                        if_metric=$((if_metric+1))
+                    fi
+                done
+            fi
+
+            # update /etc/resolv.conf
+            make_resolv_conf
+        else
+            # flush all IPs from interface
+            ip -4 addr flush dev ${interface}
+            ipset_flush ${interface}
+
+            # clear possible old route rules
+            ip -4 rule del prio `get_iface_n`0 >/dev/null 2>/dev/null
+            ip -4 rule del prio `get_iface_n`1 >/dev/null 2>/dev/null
+            exit_with_hooks 2
+        fi
+
+        ;;
+
+    ### DHCPv6 Handlers
+    # TODO handle prefix change: ?based on ${old_ip6_prefix} and ${new_ip6_prefix}?
+
+    PREINIT6)
+        true
+
+        ;;
+
+    BOUND6|RENEW6|REBIND6)
+        true
+
+        ;;
+
+    DEPREF6)
+        true
+
+        ;;
+
+    EXPIRE6|RELEASE6|STOP6)
+        true
+
+        ;;
+esac
+
+exit_with_hooks 0

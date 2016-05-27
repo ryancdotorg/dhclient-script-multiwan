@@ -1,0 +1,68 @@
+#!/bin/sh -e
+### BEGIN INIT INFO
+# Provides:          routing-rules
+# Required-Start:    mountkernfs $local_fs urandom
+# Required-Stop:     $local_fs
+# Default-Start:     S
+# Default-Stop:      0 6
+# Short-Description: Start routing-rules
+# Description:       Run the routing-rules start script
+### END INIT INFO
+
+# find the rule for the main table
+MAIN_RULE_PRIO=`/sbin/ip -4 rule show | grep ':\s*from all lookup main\s*$' | cut -d : -f 1`
+
+# make sure the main table rule is at priority 500
+if [ -n "$MAIN_RULE_PRIO" ] && [ "$MAIN_RULE_PRIO" -ne 500 ]
+then
+	/sbin/ip -4 rule del prio $MAIN_RULE_PRIO
+	/sbin/ip -4 rule add from all lookup main prio 500
+fi
+
+# route marked packets
+/sbin/ip -4 rule del prio 10101 >/dev/null 2>/dev/null || true
+/sbin/ip -4 rule del prio 10102 >/dev/null 2>/dev/null || true
+/sbin/ip -4 rule del prio 10200 >/dev/null 2>/dev/null || true
+
+# the four LSB will specify the WAN to use
+/sbin/ip -4 rule add fwmark 0x01/0x0f lookup wan_cable prio 10101
+/sbin/ip -4 rule add fwmark 0x02/0x0f lookup wan_fiber prio 10102
+
+# if the 0x10 bit is set, do not fall through to whatever is up
+/sbin/ip -4 rule add fwmark 0x10/0x10 unreachable prio 10200
+
+
+# default route
+/sbin/ip -4 rule del prio 20001 >/dev/null 2>/dev/null || true
+/sbin/ip -4 rule del prio 20002 >/dev/null 2>/dev/null || true
+/sbin/ip -4 rule add from all lookup wan_cable prio 20001
+/sbin/ip -4 rule add from all lookup wan_fiber prio 20002
+
+
+# null route reserved ip addresses
+/sbin/ip -4 route flush table martians
+
+# RFC1918
+/sbin/ip -4 route add unreachable 10.0.0.0/8      table martians
+/sbin/ip -4 route add unreachable 172.16.0.0/12   table martians
+/sbin/ip -4 route add unreachable 192.168.0.0/16  table martians
+
+# Carrier-grade NAT
+/sbin/ip -4 route add unreachable 100.64.0.0/10   table martians
+
+# Link local
+/sbin/ip -4 route add unreachable 169.254.0.0/16  table martians
+
+# RFC5736
+/sbin/ip -4 route add unreachable 192.0.0.0/24    table martians
+
+# RFC2544
+/sbin/ip -4 route add unreachable 198.18.0.0/15   table martians
+
+# RFC5737
+/sbin/ip -4 route add unreachable 192.0.2.0/24    table martians
+/sbin/ip -4 route add unreachable 198.51.100.0/24 table martians
+/sbin/ip -4 route add unreachable 203.0.113.0/24  table martians
+
+/sbin/ip -4 rule del prio 999 >/dev/null 2>/dev/null || true
+/sbin/ip -4 rule add from all lookup martians prio 999
